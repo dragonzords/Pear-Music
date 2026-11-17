@@ -26,6 +26,14 @@ on:
       tag:
         required: true
         type: string
+  # Manual start: Actions tab → Release → Run workflow, then type the tag (e.g. v0.3.6).
+  # The tag is created on the branch you pick if it doesn't exist yet.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag, must match versionName (e.g. v0.3.6)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -34,11 +42,22 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      TAG_NAME: ${{ inputs.tag || github.ref_name }}
+      TAG_NAME: ${{ inputs.tag || inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+
+      # Manual runs: make the tag if it isn't there yet, so the release has one to attach to.
+      # (A tag pushed with the workflow token doesn't trigger the tag-push run, so no double build.)
+      - name: Create the tag if it doesn't exist
+        if: github.ref_type != 'tag'
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null; then
+            echo "$TAG_NAME already exists."
+          else
+            git tag "$TAG_NAME" && git push origin "$TAG_NAME"
+          fi
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
