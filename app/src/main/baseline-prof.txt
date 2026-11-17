@@ -1,0 +1,7 @@
+# Startup profile: Android compiles these ahead of time when the app is installed
+# (via androidx.profileinstaller), instead of interpreting them on the first launches.
+# All of Pear Music's own code, and the YouTube Music client.
+HSPLcom/github/asphyx/pearmusic/**->**(**)**
+HSPLcom/enes/innertube/**->**(**)**
+Lcom/github/asphyx/pearmusic/**;
+Lcom/enes/innertube/**;

@@ -1,0 +1,125 @@
+name: Release
+
+# Push a tag like v0.3.2 and this builds a signed APK and publishes it as a GitHub
+# Release with two APKs (arm64-v8a and armeabi-v7a). The in-app updater checks this same
+# "latest release" and installs the APK that matches the phone's architecture.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   KEYSTORE_BASE64     - your release keystore, base64-encoded
+#                         (base64 -w0 release.keystore  — or on Windows:
+#                          certutil -encodehex release.keystore out.b64 0x40000001)
+#   KEYSTORE_PASSWORD   - the keystore (store) password
+#   KEY_ALIAS           - the key alias inside the keystore
+#   KEY_PASSWORD        - the key password
+#
+# IMPORTANT: this must be the SAME key that signed the Pear Music already installed on
+# people's phones. Android refuses to install an update signed with a different key.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Also run by scheduled-release.yml at a set time (tags pushed by a workflow don't
+  # start other workflows, so it calls this one directly).
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Work out the version from the tag
+        id: ver
+        run: |
+          TAG="${TAG_NAME#v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          GRADLE_VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          echo "Tag version: $TAG — gradle versionName: $GRADLE_VER"
+          if [ "$TAG" != "$GRADLE_VER" ]; then
+            echo "::error::Tag v$TAG does not match versionName \"$GRADLE_VER\" in app/build.gradle.kts. Bump versionName (and versionCode) to match the tag."
+            exit 1
+          fi
+
+      - name: Restore the signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::KEYSTORE_BASE64 secret is not set. Add your release keystore and passwords as repository secrets."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          cat > "$RUNNER_TEMP/keystore.properties" <<EOF
+          storeFile=$RUNNER_TEMP/release.keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      # -PabiSplit: one APK per architecture (arm64-v8a and armeabi-v7a), see app/build.gradle.kts.
+      - name: Build signed release APKs (arm64 + arm)
+        env:
+          PEARMUSIC_KEYSTORE: ${{ runner.temp }}/keystore.properties
+        run: ./gradlew :app:assembleRelease -PabiSplit --no-daemon
+
+      - name: Rename the APKs
+        run: |
+          mkdir -p dist
+          for abi in arm64-v8a armeabi-v7a; do
+            src="app/build/outputs/apk/release/app-${abi}-release.apk"
+            if [ ! -f "$src" ]; then
+              echo "::error::Missing $src. Build output:"
+              ls -la app/build/outputs/apk/release/
+              exit 1
+            fi
+            cp "$src" "dist/PearMusic-${{ steps.ver.outputs.version }}-${abi}.apk"
+          done
+          ls -la dist/
+
+      # Hand-written notes in docs/release-notes/<tag>.md if there are any (they also
+      # show in the in-app update sheet), otherwise GitHub's generated list of changes.
+      - name: Pick the release notes
+        id: notes
+        run: |
+          NOTES="docs/release-notes/${TAG_NAME}.md"
+          if [ -f "$NOTES" ]; then
+            echo "path=$NOTES" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Pear Music ${{ steps.ver.outputs.version }}
+          tag_name: ${{ env.TAG_NAME }}
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
+          make_latest: true
+          files: dist/*.apk

@@ -1,0 +1,579 @@
+package com.github.asphyx.pearmusic.playback
+
+import android.app.PendingIntent
+import android.content.Intent
+import android.util.Log
+import androidx.annotation.OptIn
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaLibraryService.LibraryParams
+import androidx.media3.session.MediaLibraryService.MediaLibrarySession
+import com.github.asphyx.pearmusic.MainActivity
+import com.github.asphyx.pearmusic.download.DownloadUtil
+import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+
+/**
+ * Media3 playback service. Background play, notification, lockscreen and
+ * Bluetooth controls come from MediaSessionService.
+ *
+ * Data path: CacheDataSource (downloaded songs, keyed by videoId) → on a miss,
+ * StreamResolver turns the placeholder URI into a fresh googlevideo URL.
+ */
+@OptIn(UnstableApi::class)
+@AndroidEntryPoint
+class PlaybackService : androidx.media3.session.MediaLibraryService() {
+
+    @Inject lateinit var resolver: StreamResolver
+    @Inject lateinit var downloads: DownloadUtil
+    @Inject lateinit var settings: com.github.asphyx.pearmusic.data.SettingsStore
+    @Inject lateinit var connection: PlayerConnection
+    @Inject lateinit var playCache: com.github.asphyx.pearmusic.download.PlaybackCache
+    @Inject lateinit var quality: com.github.asphyx.pearmusic.premium.QualityStore
+
+    private val fx = AudioFx()
+    private val serviceScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main + kotlinx.coroutines.SupervisorJob())
+
+    /** EQ preset + Sound Check gain for whatever is playing now. */
+    private fun applyFx(player: Player) {
+        val id = player.currentMediaItem?.mediaId
+        val gain = if (settings.soundCheck.value && id != null) AudioFx.soundCheckGain(quality.loudness(id)) else 0f
+        fx.set(settings.eqPreset.value, gain)
+    }
+
+    private var mediaSession: MediaLibrarySession? = null
+    @Inject lateinit var repository: com.github.asphyx.pearmusic.data.MusicRepository
+    @Inject lateinit var libraryStore: com.github.asphyx.pearmusic.data.LibraryStore
+    private val car by lazy { CarLibrary(repository, libraryStore, downloads, playCache, serviceScope) }
+    private lateinit var sourceFactory: DefaultMediaSourceFactory
+    private var retryId: String? = null
+    private var retries = 0
+
+    override fun onCreate() {
+        super.onCreate()
+
+        val keyFactory = androidx.media3.datasource.cache.CacheKeyFactory { spec ->
+            spec.uri.getQueryParameter("v") ?: spec.key ?: spec.uri.toString()
+        }
+        // Listening cache: everything you stream is saved as it plays (LRU, size in Settings).
+        val listeningFactory = CacheDataSource.Factory()
+            .setCache(playCache.cache)
+            .setUpstreamDataSourceFactory(resolver.dataSourceFactory)
+            .setCacheKeyFactory(keyFactory)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        // Downloads first (read-only), then the listening cache, then the network.
+        val dataSourceFactory = CacheDataSource.Factory()
+            .setCache(downloads.cache)
+            .setUpstreamDataSourceFactory(listeningFactory)
+            .setCacheWriteDataSinkFactory(null) // read-only: only downloads write
+            .setCacheKeyFactory(keyFactory)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+
+        sourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+        val player = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(sourceFactory)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .setUsage(C.USAGE_MEDIA)
+                    .build(),
+                /* handleAudioFocus = */ true,
+            )
+            // We handle "becoming noisy" ourselves (see noisyReceiver) so a flaky USB/AUX
+            // adapter that blips the audio output for a moment doesn't bounce playback.
+            .setHandleAudioBecomingNoisy(false)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .build()
+
+        player.addListener(RecoveryListener(player))
+        registerNoisyHandling(player)
+        fx.attach(player.audioSessionId)
+        player.addListener(object : Player.Listener {
+            override fun onAudioSessionIdChanged(audioSessionId: Int) { fx.attach(audioSessionId); applyFx(player) }
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = applyFx(player)
+        })
+        serviceScope.launch {
+            kotlinx.coroutines.flow.combine(settings.eqPreset, settings.soundCheck) { _, _ -> }.collect { applyFx(player) }
+        }
+        startCrossfade(player)
+
+        val openApp = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        // The session sees the player through the lock-screen lyrics layer.
+        val sessionPlayer = LyricsMetadataPlayer(player)
+        localPlayer = player
+        localSessionPlayer = sessionPlayer
+        LockScreenLyrics.player = sessionPlayer
+        mediaSession = MediaLibrarySession.Builder(this, sessionPlayer, SessionCallback())
+            .setSessionActivity(openApp)
+            .build()
+        // Lock screen / notification: a ★ button next to the transport controls.
+        player.addListener(object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                refreshFavoriteButton()
+                playCache.refresh() // the song that just finished is now complete in the cache
+            }
+
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_ENDED || state == Player.STATE_READY) playCache.refresh()
+            }
+        })
+        connection.favoriteChanged = { handler.post { refreshFavoriteButton() } }
+        refreshFavoriteButton()
+        runCatching { setUpCast(player, dataSourceFactory) }.onFailure { Log.w(TAG, "Cast setup failed", it) }
+    }
+
+    // ------------------------------------------------------------- cast (beta)
+
+    private lateinit var localPlayer: ExoPlayer
+    private lateinit var localSessionPlayer: LyricsMetadataPlayer
+    private var castPlayer: androidx.media3.cast.CastPlayer? = null
+    private var castSessionPlayer: LyricsMetadataPlayer? = null
+    private var castServer: com.github.asphyx.pearmusic.playback.cast.CastServer? = null
+
+    /** What the speaker was playing, kept up to date: the queue comes back to the phone from it. */
+    private var castQueue: List<MediaItem> = emptyList()
+    private var castIndex = 0
+    private var castPosition = 0L
+    private var castPlaying = false
+
+    private fun setUpCast(local: ExoPlayer, dataSources: androidx.media3.datasource.DataSource.Factory) {
+        val castContext = com.github.asphyx.pearmusic.playback.cast.Cast.castContext(this) ?: return
+        val server = com.github.asphyx.pearmusic.playback.cast.CastServer(dataSources)
+        castServer = server
+        val cp = androidx.media3.cast.CastPlayer(castContext, com.github.asphyx.pearmusic.playback.cast.CastItemConverter(server))
+        castPlayer = cp
+        cp.addListener(object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = refreshFavoriteButton()
+        })
+        cp.setSessionAvailabilityListener(object : androidx.media3.cast.SessionAvailabilityListener {
+            override fun onCastSessionAvailable() = toCast(local, cp, server)
+            override fun onCastSessionUnavailable() = toPhone(local, cp, server)
+        })
+        com.github.asphyx.pearmusic.playback.cast.Cast.startDiscovery(this)
+        if (cp.isCastSessionAvailable) toCast(local, cp, server)
+    }
+
+    private fun castDeviceName(): String? =
+        com.github.asphyx.pearmusic.playback.cast.Cast.castContext(this)?.sessionManager?.currentCastSession?.castDevice?.friendlyName
+
+    private fun toCast(local: ExoPlayer, cp: androidx.media3.cast.CastPlayer, server: com.github.asphyx.pearmusic.playback.cast.CastServer) {
+        server.start()
+        if (com.github.asphyx.pearmusic.playback.cast.CastServer.lanAddress() == null) {
+            android.widget.Toast.makeText(this, com.github.asphyx.pearmusic.ui.theme.tr("Connect to Wi-Fi to cast", "Yayınlamak için Wi-Fi'a bağlanın"), android.widget.Toast.LENGTH_LONG).show()
+        }
+        releaseTail()
+        val count = local.mediaItemCount
+        if (count > 0) {
+            // A window around the current song: a speaker takes a limited queue in one go.
+            val index = local.currentMediaItemIndex.coerceIn(0, count - 1)
+            val from = (index - 5).coerceAtLeast(0)
+            val to = (index + 80).coerceAtMost(count)
+            val items = (from until to).map { local.getMediaItemAt(it) }
+            cp.repeatMode = local.repeatMode
+            cp.setMediaItems(items, index - from, local.currentPosition.coerceAtLeast(0))
+            cp.playWhenReady = local.playWhenReady
+            cp.prepare()
+        }
+        local.pause()
+        val wrapper = castSessionPlayer ?: LyricsMetadataPlayer(cp).also { castSessionPlayer = it }
+        LockScreenLyrics.player = wrapper
+        mediaSession?.player = wrapper
+        com.github.asphyx.pearmusic.playback.cast.Cast.sessionStarted(castDeviceName())
+        Log.i(TAG, "Cast: playing on ${castDeviceName()}")
+        handler.removeCallbacks(castTick)
+        handler.post(castTick)
+    }
+
+    private val castTick = object : Runnable {
+        override fun run() {
+            val cp = castPlayer ?: return
+            if (!cp.isCastSessionAvailable) return
+            if (cp.mediaItemCount > 0) {
+                castQueue = (0 until cp.mediaItemCount).map { cp.getMediaItemAt(it) }
+                castIndex = cp.currentMediaItemIndex
+                castPosition = cp.currentPosition
+                castPlaying = cp.playWhenReady
+            }
+            handler.postDelayed(this, 1000)
+        }
+    }
+
+    private fun toPhone(local: ExoPlayer, cp: androidx.media3.cast.CastPlayer, server: com.github.asphyx.pearmusic.playback.cast.CastServer) {
+        handler.removeCallbacks(castTick)
+        val items = if (cp.mediaItemCount > 0) (0 until cp.mediaItemCount).map { cp.getMediaItemAt(it) } else castQueue
+        val index = if (cp.mediaItemCount > 0) cp.currentMediaItemIndex else castIndex
+        val position = if (cp.mediaItemCount > 0) cp.currentPosition else castPosition
+        if (items.isNotEmpty()) {
+            local.setMediaItems(items, index.coerceIn(0, items.size - 1), position.coerceAtLeast(0))
+            local.repeatMode = cp.repeatMode
+            local.prepare()
+        }
+        // Like other music apps: when the speaker goes away, the phone waits paused.
+        local.playWhenReady = false
+        LockScreenLyrics.player = localSessionPlayer
+        mediaSession?.player = localSessionPlayer
+        server.stop()
+        castQueue = emptyList()
+        com.github.asphyx.pearmusic.playback.cast.Cast.sessionEnded()
+        Log.i(TAG, "Cast: back on the phone (${items.size} songs)")
+    }
+
+    /** Re-resolves once on failure (e.g. expired URL → 403), then skips the track. */
+    private inner class RecoveryListener(private val player: ExoPlayer) : Player.Listener {
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            retryId = null
+            retries = 0
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            val id = player.currentMediaItem?.mediaId
+            val http = generateSequence<Throwable>(error) { it.cause }
+                .filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
+                .firstOrNull()
+            Log.e(TAG, "Playback error on $id: ${error.errorCodeName} http=${http?.responseCode}", error)
+            if (id != null) {
+                resolver.invalidate(id)
+                // A song that only half-streamed (e.g. a connection blip during a Premium
+                // stream) leaves a partial in the listening cache. On the next attempt the
+                // Premium URL may be dead and it falls back to a different format, so the
+                // cached seconds play and then the rest won't decode — it skips every time.
+                // Drop the partial (a finished download or fully-cached song is untouched)
+                // so the retry re-streams it in one consistent format.
+                if (!playCache.isCached(id)) playCache.evict(id)
+
+                // Premium stream died mid-song: don't skip. Fall back to the regular stream
+                // and carry on from the same spot. prepare() keeps the current position, and
+                // demoting Premium for this song makes the re-resolve pick the stable stream.
+                if (quality.isPremium(id)) {
+                    resolver.demotePremium(id)
+                    Log.i(TAG, "Premium failed on $id — continuing on the regular stream")
+                    retryId = id
+                    retries = 0
+                    player.prepare()
+                    player.play()
+                    return
+                }
+            }
+
+            if (retryId != id) {
+                retryId = id
+                retries = 0
+            }
+            if (retries < 1) {
+                retries++
+                player.prepare()
+                player.play()
+            } else if (player.hasNextMediaItem()) {
+                player.seekToNextMediaItem()
+                player.prepare()
+                player.play()
+            }
+        }
+    }
+
+    // ------------------------------------------------------- lock-screen favorite
+
+    private val favoriteCommand = androidx.media3.session.SessionCommand(ACTION_FAVORITE, android.os.Bundle.EMPTY)
+
+    private fun refreshFavoriteButton() {
+        val session = mediaSession ?: return
+        val id = session.player.currentMediaItem?.mediaId
+        val fav = id != null && connection.isFavorite(id)
+        val button = androidx.media3.session.CommandButton.Builder()
+            .setDisplayName(if (fav) "Unfavorite" else "Favorite")
+            .setIconResId(if (fav) com.github.asphyx.pearmusic.R.drawable.ic_w_star else com.github.asphyx.pearmusic.R.drawable.ic_w_star_outline)
+            .setSessionCommand(favoriteCommand)
+            .build()
+        session.setCustomLayout(com.google.common.collect.ImmutableList.of(button))
+    }
+
+    /** Session callbacks: the lock-screen ★, plus the browsable library for Android Auto. */
+    private inner class SessionCallback : MediaLibrarySession.Callback {
+        override fun onGetLibraryRoot(session: MediaLibrarySession, browser: MediaSession.ControllerInfo, params: LibraryParams?) =
+            car.root(params)
+
+        override fun onGetChildren(
+            session: MediaLibrarySession, browser: MediaSession.ControllerInfo, parentId: String, page: Int, pageSize: Int, params: LibraryParams?,
+        ) = car.children(parentId, params)
+
+        override fun onGetItem(session: MediaLibrarySession, browser: MediaSession.ControllerInfo, mediaId: String) = car.item(mediaId)
+
+        override fun onSearch(session: MediaLibrarySession, browser: MediaSession.ControllerInfo, query: String, params: LibraryParams?) =
+            car.search(session, browser, query, params)
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession, browser: MediaSession.ControllerInfo, query: String, page: Int, pageSize: Int, params: LibraryParams?,
+        ) = car.searchResult(query, page, pageSize, params)
+
+        override fun onAddMediaItems(
+            mediaSession: MediaSession, controller: MediaSession.ControllerInfo, mediaItems: MutableList<MediaItem>,
+        ): com.google.common.util.concurrent.ListenableFuture<MutableList<MediaItem>> =
+            com.google.common.util.concurrent.Futures.immediateFuture(mediaItems.map(car::complete).toMutableList())
+
+        override fun onSetMediaItems(
+            mediaSession: MediaSession, controller: MediaSession.ControllerInfo, mediaItems: MutableList<MediaItem>, startIndex: Int, startPositionMs: Long,
+        ) = car.resolve(mediaItems, startIndex, startPositionMs)
+
+        override fun onConnect(session: MediaSession, controller: MediaSession.ControllerInfo): MediaSession.ConnectionResult {
+            val commands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon().add(favoriteCommand).build()
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(commands)
+                .build()
+        }
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: androidx.media3.session.SessionCommand,
+            args: android.os.Bundle,
+        ): com.google.common.util.concurrent.ListenableFuture<androidx.media3.session.SessionResult> {
+            if (customCommand.customAction == ACTION_FAVORITE) {
+                session.player.currentMediaItem?.let { item ->
+                    with(PlayerConnection) { connection.toggleFavorite(item.toSong()) }
+                }
+                refreshFavoriteButton()
+            }
+            return com.google.common.util.concurrent.Futures.immediateFuture(
+                androidx.media3.session.SessionResult(androidx.media3.session.SessionResult.RESULT_SUCCESS),
+            )
+        }
+    }
+
+    // -------------------------------------------- output changes (becoming noisy)
+
+    private var noisyPlayer: ExoPlayer? = null
+
+    /** Runs a beat after the output blipped: pause only if it's really gone. */
+    private val noisyPauseCheck = Runnable {
+        val p = noisyPlayer ?: return@Runnable
+        if (hasListeningOutput()) return@Runnable      // came right back — a blip, keep playing
+        if (p.playWhenReady) {
+            Log.i(TAG, "Audio output gone — pausing")
+            p.pause()
+        }
+    }
+
+    private val noisyReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: Intent?) {
+            if (intent?.action != android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY) return
+            // A cheap USB-C/AUX adapter re-announces its output every so often. Pausing on
+            // each blip fought ExoPlayer's resume into a play/pause loop. So don't pause
+            // instantly: wait briefly and pause only if the output is still gone (a real
+            // unplug), not if the adapter reconnects a moment later.
+            handler.removeCallbacks(noisyPauseCheck)
+            handler.postDelayed(noisyPauseCheck, NOISY_GRACE_MS)
+        }
+    }
+
+    private fun registerNoisyHandling(player: ExoPlayer) {
+        noisyPlayer = player
+        androidx.core.content.ContextCompat.registerReceiver(
+            this, noisyReceiver,
+            android.content.IntentFilter(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        // One line per automatic play/pause with the cause — a flaky-adapter loop stands out.
+        player.addListener(object : Player.Listener {
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                Log.i(TAG, "playWhenReady=$playWhenReady (${reasonName(reason)}) output=${if (hasListeningOutput()) "device" else "speaker"}")
+            }
+        })
+    }
+
+    /** A real listening output — wired, USB/AUX, Bluetooth or a dock — is connected right now. */
+    private fun hasListeningOutput(): Boolean {
+        val audio = getSystemService(android.media.AudioManager::class.java) ?: return false
+        return runCatching {
+            audio.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS).any { it.type in LISTENING_OUTPUTS }
+        }.getOrDefault(false)
+    }
+
+    private fun reasonName(reason: Int): String = when (reason) {
+        Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST -> "USER"
+        Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS -> "FOCUS_LOSS"
+        Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> "BECOMING_NOISY"
+        Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE -> "REMOTE"
+        Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM -> "END_OF_ITEM"
+        else -> "reason$reason"
+    }
+
+    // ------------------------------------------------------------- crossfade
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * Real crossfade (AutoMix-style): near the end of a song a second "tail" player picks
+     * up its last seconds and fades them out, while the session's player has already
+     * moved on to the next song and fades it in, so the two overlap. Off (0) leaves
+     * ExoPlayer's gapless playback untouched.
+     */
+    private var tail: ExoPlayer? = null
+    private var tailStartMs = -1L          // position in the ending song where the overlap starts
+    private var handoffAt = 0L             // uptime when the overlap began; 0 = none
+    private var ourTransition = false
+    private var softStartAt = 0L           // manual skips fade in briefly
+
+    private fun startCrossfade(player: ExoPlayer) {
+        player.addListener(object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                if (ourTransition) { ourTransition = false; return }
+                // Any other change (skip, new queue) cancels an overlap in progress.
+                releaseTail()
+                if (settings.crossfadeSeconds.value > 0 && reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                    softStartAt = android.os.SystemClock.uptimeMillis()
+                    player.volume = 0f
+                } else {
+                    player.volume = 1f
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                val t = tail ?: return
+                if (handoffAt > 0) { if (isPlaying) t.play() else t.pause() }
+            }
+        })
+
+        val tick = object : Runnable {
+            override fun run() {
+                runCatching { crossfadeTick(player) }.onFailure { Log.w(TAG, "crossfade", it); releaseTail() }
+                handler.postDelayed(this, 40)
+            }
+        }
+        handler.post(tick)
+    }
+
+    private fun crossfadeTick(player: ExoPlayer) {
+        val fade = settings.crossfadeSeconds.value * 1000L
+        val now = android.os.SystemClock.uptimeMillis()
+        val curve = { x: Float -> kotlin.math.sin(x.coerceIn(0f, 1f) * (Math.PI / 2)).toFloat() }
+
+        // 1. An overlap in progress: tail fades out, the new song fades in.
+        if (handoffAt > 0) {
+            val t = (now - handoffAt).toFloat() / fade.coerceAtLeast(1)
+            tail?.volume = curve(1f - t)
+            player.volume = curve(t)
+            if (t >= 1f) { releaseTail(); player.volume = 1f }
+            return
+        }
+        // 2. Soft start after a manual skip.
+        if (softStartAt > 0) {
+            val t = (now - softStartAt) / 450f
+            player.volume = curve(t)
+            if (t >= 1f) softStartAt = 0
+        }
+        if (fade <= 0 || !player.isPlaying) return
+
+        val duration = player.duration
+        if (duration == C.TIME_UNSET || duration < fade * 3) return
+        if (!player.hasNextMediaItem() || player.repeatMode == Player.REPEAT_MODE_ONE) return
+        val pos = player.currentPosition
+        val start = duration - fade
+
+        // 3. Shortly before the overlap, get the tail ready at the overlap point.
+        if (tail == null && pos >= start - 2500 && pos < start) {
+            val item = player.currentMediaItem ?: return
+            tailStartMs = start
+            tail = ExoPlayer.Builder(this)
+                .setMediaSourceFactory(sourceFactory)
+                .setAudioAttributes(
+                    AudioAttributes.Builder().setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).setUsage(C.USAGE_MEDIA).build(),
+                    false,
+                )
+                .build().apply {
+                    setMediaItem(item, start)
+                    volume = 1f
+                    playWhenReady = false
+                    prepare()
+                }
+            Log.i(TAG, "Crossfade: preparing tail at ${start}ms of ${item.mediaId}")
+        }
+
+        // 4. Overlap point reached: tail takes over the ending, player moves on.
+        val t = tail
+        if (t != null && pos >= tailStartMs) {
+            if (t.playbackState == Player.STATE_READY) {
+                t.seekTo(pos)
+                t.play()
+                ourTransition = true
+                player.volume = 0f
+                player.seekToNextMediaItem()
+                handoffAt = now
+                Log.i(TAG, "Crossfade: overlap started (${fade}ms)")
+            } else if (pos > tailStartMs + 1500) {
+                // Tail couldn't load in time: fall back to plain fade-out of this song.
+                releaseTail()
+            }
+        } else if (t == null && pos >= start) {
+            player.volume = curve((duration - pos).toFloat() / fade)
+        }
+    }
+
+    private fun releaseTail() {
+        tail?.release()
+        tail = null
+        tailStartMs = -1L
+        handoffAt = 0L
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? =
+        mediaSession
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val player = mediaSession?.player
+        if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
+            stopSelf()
+        }
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        runCatching { unregisterReceiver(noisyReceiver) }
+        noisyPlayer = null
+        releaseTail()
+        fx.release()
+        LockScreenLyrics.player = null
+        serviceScope.cancel()
+        castPlayer?.setSessionAvailabilityListener(null)
+        castPlayer?.release()
+        castServer?.stop()
+        if (::localPlayer.isInitialized) localPlayer.release()
+        mediaSession?.release()
+        mediaSession = null
+        super.onDestroy()
+    }
+
+    companion object {
+        const val TAG = "PearMusic"
+        const val ACTION_FAVORITE = "com.github.asphyx.pearmusic.FAVORITE"
+        private const val NOISY_GRACE_MS = 1200L
+        private val LISTENING_OUTPUTS = intArrayOf(
+            android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            android.media.AudioDeviceInfo.TYPE_AUX_LINE,
+            android.media.AudioDeviceInfo.TYPE_LINE_ANALOG,
+            android.media.AudioDeviceInfo.TYPE_LINE_DIGITAL,
+            android.media.AudioDeviceInfo.TYPE_USB_HEADSET,
+            android.media.AudioDeviceInfo.TYPE_USB_DEVICE,
+            android.media.AudioDeviceInfo.TYPE_USB_ACCESSORY,
+            android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+            android.media.AudioDeviceInfo.TYPE_BLE_HEADSET,
+            android.media.AudioDeviceInfo.TYPE_DOCK,
+        )
+        fun placeholderUri(videoId: String) = StreamResolver.placeholderUri(videoId)
+    }
+}
