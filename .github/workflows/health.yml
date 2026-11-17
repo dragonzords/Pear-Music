@@ -31,7 +31,9 @@ jobs:
       - name: Run the checks
         id: tests
         continue-on-error: true
-        run: ./gradlew :innertube:testDebugUnitTest --no-daemon
+        run: |
+          chmod +x gradlew
+          ./gradlew :innertube:testDebugUnitTest --no-daemon
 
       - name: Summarise
         id: summary

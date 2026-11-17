@@ -1,7 +1,7 @@
 <h1 align="center">Pear Music</h1>
 
 <p align="center">
-  <a href="https://github.com/asphyx/Pear-Music/releases/latest"><img src="https://img.shields.io/github/v/release/asphyx/Pear-Music?label=download&color=fa2d48"></a>
+  <a href="https://github.com/dragonzords/Pear-Music/releases/latest"><img src="https://img.shields.io/github/v/release/dragonzords/Pear-Music?label=download&color=fa2d48"></a>
   <img src="https://img.shields.io/badge/Android-12%2B-34C759">
   <img src="https://img.shields.io/badge/license-GPL--3.0-0A84FF">
 </p>
@@ -120,7 +120,7 @@ stats and settings, and **re-downloads your downloads and Offline Mix**.
 
 ## 📥 Install
 
-Download the latest APK from [**Releases**](https://github.com/asphyx/Pear-Music/releases/latest)
+Download the latest APK from [**Releases**](https://github.com/dragonzords/Pear-Music/releases/latest)
 and open it on your phone (allow installing from your browser or file manager when asked).
 Android 12 or newer.
 

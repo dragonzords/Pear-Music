@@ -21,7 +21,7 @@ import java.util.Locale
  * Reports never include sign-in data, cookies, links with tokens or email addresses.
  */
 object ProblemReport {
-    private const val REPO = "asphyx/Pear-Music"
+    private const val REPO = "dragonzords/Pear-Music"
     private var dir: File? = null
 
     /** Saves any crash for the next launch, then lets Android close the app as usual. */

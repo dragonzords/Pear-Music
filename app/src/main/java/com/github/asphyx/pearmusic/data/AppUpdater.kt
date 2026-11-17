@@ -57,7 +57,7 @@ object AppUpdater {
     private const val NOTIFICATION_ID = 7001
 
     /** The GitHub repository that hosts the releases. */
-    private const val REPO = "asphyx/Pear-Music"
+    private const val REPO = "dragonzords/Pear-Music"
     private const val LATEST = "https://api.github.com/repos/$REPO/releases/latest"
 
     @Serializable

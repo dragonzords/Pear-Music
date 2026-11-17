@@ -73,7 +73,7 @@ become the "what's new" text in the in-app update sheet.
 ## How the in-app updater works
 
 - On launch and every ~12 hours in the background, the app reads
-  `https://api.github.com/repos/asphyx/Pear-Music/releases/latest`.
+  `https://api.github.com/repos/dragonzords/Pear-Music/releases/latest`.
 - If the release's version is higher than the installed one, it raises a quiet
   notification and shows the update sheet.
 - **Update** downloads the release's `.apk` asset that matches the phone's architecture
