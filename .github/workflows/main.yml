@@ -1,24 +1,27 @@
 name: Extract Zip to Repo
 
 on:
-  workflow_dispatch: # Ini biar kamu bisa jalankan manual lewat tombol "Run workflow"
+  workflow_dispatch: # Biar bisa dijalanin manual
 
 jobs:
   unzip:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Izinkan action untuk push (commit) perubahan ke repo
+      contents: write
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          # Ini bakal ngambil token dari secret yang lu simpen
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Unzip Files
         run: |
-          # Unzip file, -o artinya overwrite jika ada file yang sama
+          # Ekstrak zip
           unzip -o Pear-Music-main.zip -d ./
           
-          # Hapus file zip aslinya (opsional, jika tidak ingin zip-nya ada di repo)
+          # Hapus file zip aslinya (opsional, hapus tanda # kalau mau zip-nya hilang)
           # rm Pear-Music-main.zip
 
       - name: Commit and Push Changes
@@ -26,10 +29,13 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          # Cek apakah ada perubahan sebelum commit
+          
+          # Cek perubahan sebelum commit
           if ! git diff --cached --quiet; then
             git commit -m "Auto-extract Pear-Music-main.zip"
-            git push
+            
+            # Paksa push pakai token lu biar lolos dari proteksi workflow GitHub
+            git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git HEAD:main
           else
             echo "Tidak ada file baru yang diekstrak."
           fi
