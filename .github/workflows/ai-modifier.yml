@@ -1,0 +1,51 @@
+name: AI Code Modifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_file:
+        description: 'File yang mau diubah (contoh: src/app.js atau main.py)'
+        required: true
+        default: 'README.md'
+      commit_message:
+        description: 'Pesan commit (opsional)'
+        required: false
+        default: '🤖 AI modification'
+
+jobs:
+  modify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install requests
+
+      - name: Run AI Modifier
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+          TARGET_FILE: ${{ github.event.inputs.target_file }}
+        run: python .github/scripts/agent.py
+
+      - name: Commit & Push Changes
+        run: |
+          git config user.name "AI Fork Bot"
+          git config user.email "ai-bot@users.noreply.github.com"
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "${{ github.event.inputs.commit_message }}"
+            git push
+          else
+            echo "Tidak ada perubahan file."
+          fi
