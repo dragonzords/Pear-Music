@@ -1,0 +1,35 @@
+name: Extract Zip to Repo
+
+on:
+  workflow_dispatch: # Ini biar kamu bisa jalankan manual lewat tombol "Run workflow"
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Izinkan action untuk push (commit) perubahan ke repo
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Unzip Files
+        run: |
+          # Unzip file, -o artinya overwrite jika ada file yang sama
+          unzip -o Pear-Music-main.zip -d ./
+          
+          # Hapus file zip aslinya (opsional, jika tidak ingin zip-nya ada di repo)
+          # rm Pear-Music-main.zip
+
+      - name: Commit and Push Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          # Cek apakah ada perubahan sebelum commit
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-extract Pear-Music-main.zip"
+            git push
+          else
+            echo "Tidak ada file baru yang diekstrak."
+          fi
